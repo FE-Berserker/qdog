@@ -27,6 +27,19 @@ def load_wrench(path, cfg):
     return out
 
 
+def _safe_save(save_fn, path):
+    """输出文件被占用 (如在查看器中打开) 时, 改存 <名>_new.<后缀> 并提示, 不中断流水线。"""
+    path = Path(path)
+    try:
+        save_fn(path)
+        return path
+    except OSError:
+        alt = path.with_name(path.stem + "_new" + path.suffix)
+        save_fn(alt)
+        print(f"!! {path.name} 被占用 (可能正在查看器中打开), 已改存 {alt.name}; 关闭后可删旧换新")
+        return alt
+
+
 def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, out_dir):
     """case_wrench_csvs: {key: csv路径}; 输出 包络 xlsx + png。"""
     from openpyxl import Workbook
@@ -103,7 +116,7 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
 
     out_xlsx = out_dir / "关节载荷包络.xlsx"
     wb.properties.creator = "quad_pipeline"
-    wb.save(out_xlsx)
+    out_xlsx = _safe_save(wb.save, out_xlsx)
 
     # ---- 图: 热力图 + 包络柱状 ----
     import matplotlib
@@ -141,6 +154,6 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
     axes[1].set_xlim(-0.6, nj - 0.4)
     fig.tight_layout()
     out_png = out_dir / "关节载荷包络.png"
-    fig.savefig(out_png, dpi=140)
+    out_png = _safe_save(lambda p: fig.savefig(p, dpi=140), out_png)
     plt.close(fig)
     return out_xlsx, out_png, env, src

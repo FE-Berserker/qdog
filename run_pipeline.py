@@ -89,6 +89,8 @@ def main():
     ap.add_argument("--motions", nargs="+", default=None,
                     help="动作子集 (默认全部: walk trot jump leap drop)")
     ap.add_argument("--skip-video", action="store_true", help="跳过视频渲染")
+    ap.add_argument("--envelope-only", action="store_true",
+                    help="不重跑仿真, 仅用已有数据重建载荷包络")
     ap.add_argument("--out", default=None, help="输出根目录 (默认 results/<robot>/)")
     ap.add_argument("--list", action="store_true", help="列出机型与动作后退出")
     args = ap.parse_args()
@@ -113,46 +115,46 @@ def main():
     print(f"机型 {cfg.name} ({cfg.model_xml}), 动作: {keys}, 输出: {out_root}")
 
     done = []
-    for k in keys:
-        stats, fallen, avi = process_motion(k, cfg, scene, out_root,
-                                            do_video=not args.skip_video)
-        done.append(k)
-        # 动作摘要行 (供调用方/agent 汇报): 一行关键指标, 跌倒显著标注
-        flag = "  !!跌倒截断!!" if fallen else ""
-        print(f"[{k}] 摘要: v={stats['v_mean']:.2f} m/s, 姿态pp=({stats['roll_pp']:.1f}°, "
-              f"{stats['pitch_pp']:.1f}°), GRF峰值={stats['grf_peak']:.0f} N, "
-              f"力矩峰值={stats['peak_tq'].max():.1f} N·m, 视频={avi}{flag}")
+    if not args.envelope_only:
+        for k in keys:
+            stats, fallen, avi = process_motion(k, cfg, scene, out_root,
+                                                do_video=not args.skip_video)
+            done.append(k)
+            # 动作摘要行 (供调用方/agent 汇报): 一行关键指标, 跌倒显著标注
+            flag = "  !!跌倒截断!!" if fallen else ""
+            print(f"[{k}] 摘要: v={stats['v_mean']:.2f} m/s, 姿态pp=({stats['roll_pp']:.1f}°, "
+                  f"{stats['pitch_pp']:.1f}°), GRF峰值={stats['grf_peak']:.0f} N, "
+                  f"力矩峰值={stats['peak_tq'].max():.1f} N·m, 视频={avi}{flag}")
 
-    # ---- 包络 (汇总本次确认完成的动作) ----
-    if not done:
-        print("\n无确认完成的动作, 跳过包络汇总。")
-        return
+    # ---- 包络: 总是汇总结果目录中所有已有 wrench 数据的动作 ----
+    # (不能用"本次运行的动作": 单独重跑某动作会把完整包络覆盖成单工况)
     print("\n===== 载荷包络 =====")
     csvs, names, descs = {}, {}, {}
-    for k in done:
+    for k in MOTIONS:
         p = out_root / k / "wrench.csv"
         if p.exists():
             csvs[k] = p
             names[k] = MOTIONS[k].CN
             descs[k] = MOTIONS[k].DESC
-    if csvs:
-        # envelope 期望 list 顺序对齐; 转 list
-        ks = list(csvs)
-        ox, op, env, src = envelope.build_envelope(
-            cfg,
-            {k: csvs[k] for k in ks},
-            [names[k] for k in ks],
-            [descs[k] for k in ks],
-            out_root)
-        print("saved:", ox)
-        print("saved:", op)
-        # 终端打印包络表
-        from quad_pipeline.report import joint_meta
-        meta = joint_meta(cfg)
-        print(f"\n{'joint':<16}{'驱动max':>9}{'弯矩max':>9}{'剪力max':>9}{'轴向max':>9}  弯矩来源")
-        for i, (jn, lg, p, _) in enumerate(meta):
-            print(f"{jn:<16}{env['drive'][i]:>9.1f}{env['bend'][i]:>9.1f}"
-                  f"{env['shear'][i]:>9.1f}{env['axial'][i]:>9.1f}  {src['bend'][i]}")
+    if not csvs:
+        print("无 wrench 数据, 跳过包络汇总。")
+        return
+    ks = list(csvs)
+    ox, op, env, src = envelope.build_envelope(
+        cfg,
+        {k: csvs[k] for k in ks},
+        [names[k] for k in ks],
+        [descs[k] for k in ks],
+        out_root)
+    print("saved:", ox)
+    print("saved:", op)
+    # 终端打印包络表
+    from quad_pipeline.report import joint_meta
+    meta = joint_meta(cfg)
+    print(f"\n{'joint':<16}{'驱动max':>9}{'弯矩max':>9}{'剪力max':>9}{'轴向max':>9}  弯矩来源")
+    for i, (jn, lg, p, _) in enumerate(meta):
+        print(f"{jn:<16}{env['drive'][i]:>9.1f}{env['bend'][i]:>9.1f}"
+              f"{env['shear'][i]:>9.1f}{env['axial'][i]:>9.1f}  {src['bend'][i]}")
     print("\n全部完成。")
 
 
