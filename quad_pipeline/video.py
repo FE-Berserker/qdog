@@ -43,7 +43,8 @@ def make_cameras():
 
 
 def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
-                 fps=50, stride=None, checks=True, slope_deg=0.0, payload_kg=0.0):
+                 fps=50, stride=None, checks=True, slope_deg=0.0, payload_kg=0.0,
+                 t_win=None):
     """从轨迹 npy 渲染视频。返回 (avi_path, gif_path, [check_pngs])。
 
     slope_deg>0 (爬坡工况): 物理用重力倾斜法 (平地+斜重力), 渲染时把整机位姿
@@ -51,10 +52,16 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
     足端与坡面接触位置精确吻合, 仅用于可视化, 不影响物理。
 
     payload_kg>0 (负载工况): 在躯干上挂一个纯视觉货箱 (无碰撞/无质量),
-    尺寸按质量立方根缩放 (以 25 kg 为基准), 满载/静载直观可读。"""
+    尺寸按质量立方根缩放 (以 25 kg 为基准), 满载/静载直观可读。
+
+    t_win=(t0, t1): 只渲染该时间窗 (用于冲击/瞬态类工况: 全程视频里事件只占
+    极小比例, 单独出窗口版才看得清, 如 push 的 0.25 s 侧向冲击)。"""
+    import io
     from PIL import Image, ImageDraw
 
     A = np.load(trace_path)
+    if t_win is not None:
+        A = A[(A[:, 0] >= t_win[0]) & (A[:, 0] <= t_win[1])]
     t_all, q_all = A[:, 0], A[:, 1:20]
     Fz_all = A[:, C_FZ:C_FZ + 4]
     st_all = A[:, C_ST:C_ST + 4]
@@ -100,8 +107,12 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
     f_big, f_mid, f_small = find_font(30), find_font(22), find_font(17)
     col = (40, 130, 80)
 
-    frames = []
-    for k in range(0, len(t_all), stride):
+    # 逐帧立即 JPEG 编码: 原先把全部 PIL 帧留在内存, 8 s@50fps 需约 1 GB,
+    # 内存吃紧时 (如同时开着其他程序) 渲染会失败; 编码后每帧仅约 100 KB。
+    jpegs, gif_small, checks_pil = [], [], {}
+    idxs = list(range(0, len(t_all), stride))
+    n_frames = len(idxs)
+    for pos, k in enumerate(idxs):
         t, q = float(t_all[k]), q_all[k]
         fz, st = Fz_all[k], st_all[k]
         bx, by, bz = float(A[k, C_BX]), float(A[k, C_BY]), float(A[k, C_BZ])
@@ -146,24 +157,29 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
             d.text((x + 14, base_y - h - 18), f"{abs(fz[j]):.0f}", font=f_small, fill=(220, 220, 220))
             d.text((x + 30, base_y + 3), lg, font=f_small, fill=(200, 200, 200))
         d.line([bx0 - 4, base_y, bx0 + 4 * bw + 3 * bgap + 4, base_y], fill=(120, 120, 120))
-        frames.append(canvas)
+        if checks and pos in (0, n_frames // 2, n_frames - 1):
+            checks_pil[pos] = canvas.copy()
+        if pos % 3 == 0:
+            gif_small.append(canvas.resize((canvas.width // 2, canvas.height // 2)))
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=92)
+        jpegs.append(buf.getvalue())
     renderer.close()
 
     out_avi = Path(out_avi)
-    write_avi_mjpeg(out_avi, frames, fps)
+    write_avi_mjpeg(out_avi, jpegs, fps, (CANVAS_W, CANVAS_H))
 
     # GIF 预览
-    small = [f.resize((f.width // 2, f.height // 2)) for f in frames[::3]]
     gif = out_avi.with_name(out_avi.stem.replace("_video", "") + "_preview.gif")
-    small[0].save(gif, save_all=True, append_images=small[1:],
-                  duration=int(3000 / fps), loop=0, optimize=True)
+    gif_small[0].save(gif, save_all=True, append_images=gif_small[1:],
+                      duration=int(3000 / fps), loop=0, optimize=True)
 
     # 抽查帧
     checks_paths = []
     if checks:
-        for tag, i in (("first", 0), ("mid", len(frames) // 2), ("last", -1)):
+        for tag, i in (("first", 0), ("mid", n_frames // 2), ("last", n_frames - 1)):
             p = out_avi.with_name(out_avi.stem.replace("_video", "") + f"_{tag}.png")
-            frames[i].save(p)
+            checks_pil[i].save(p)
             checks_paths.append(p)
 
     # 可选 MP4 转码
@@ -188,15 +204,10 @@ def _chunk(fid, tag, data):
         fid.write(b"\x00")
 
 
-def write_avi_mjpeg(path, frames, fps):
-    import io
-    n = len(frames)
-    w, h = frames[0].size
-    jpegs = []
-    for im in frames:
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=92)
-        jpegs.append(buf.getvalue())
+def write_avi_mjpeg(path, jpegs, fps, size):
+    """jpegs: 已编码 JPEG 字节序列; size: (宽, 高)。"""
+    n = len(jpegs)
+    w, h = size
     with open(path, "wb") as f:
         f.write(b"RIFF" + struct.pack("<I", 0) + b"AVI ")
         avih = struct.pack("<14I", 1000000 // fps, w * h * 3 * fps, 0, 0x10,
