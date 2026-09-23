@@ -63,9 +63,14 @@ def run_wrench(motion_cls, cfg, scene_path):
 
 
 def decompose(A, cfg):
-    """分解为 drive/bend/axial/shear (各 n×12)。"""
+    """分解为 drive/bend/axial/shear + 弯矩两垂直分量 bend_c1/bend_c2 (各 n×12)。
+
+    传感器输出在子体局部系, 关节轴恒定:
+      hip 轴=x -> 弯矩分量为局部 My, Mz
+      thigh/calf 轴=y -> 弯矩分量为局部 Mx, Mz
+    """
     n = A.shape[0]
-    out = {k: np.zeros((n, 12)) for k in ("drive", "bend", "axial", "shear")}
+    out = {k: np.zeros((n, 12)) for k in ("drive", "bend", "axial", "shear", "bend_c1", "bend_c2")}
     i = 0
     for lg in cfg.legs:
         for p in cfg.parts:
@@ -73,13 +78,29 @@ def decompose(A, cfg):
             f = A[:, 1 + i * 6: 1 + i * 6 + 3]
             nt = A[:, 1 + i * 6 + 3: 1 + i * 6 + 6]
             n_drive = nt @ a
+            n_bend = nt - np.outer(n_drive, a)
             out["drive"][:, i] = n_drive
-            out["bend"][:, i] = np.linalg.norm(nt - np.outer(n_drive, a), axis=1)
+            out["bend"][:, i] = np.linalg.norm(n_bend, axis=1)
             f_ax = f @ a
             out["axial"][:, i] = f_ax
             out["shear"][:, i] = np.linalg.norm(f - np.outer(f_ax, a), axis=1)
+            perp = [k for k in range(3) if a[k] == 0]
+            out["bend_c1"][:, i] = n_bend[:, perp[0]]
+            out["bend_c2"][:, i] = n_bend[:, perp[1]]
             i += 1
     return out
+
+
+def bend_comp_names(cfg):
+    """每关节两个弯矩垂直分量的轴名: hip->(My,Mz), thigh/calf->(Mx,Mz)。"""
+    names = []
+    for lg in cfg.legs:
+        for p in cfg.parts:
+            a = cfg.part_axis[p]
+            perp = ["x", "y", "z"]
+            comp = [f"M{perp[k]}" for k in range(3) if a[k] == 0]
+            names.append(tuple(comp))
+    return names
 
 
 def wrench_csv_head(cfg):
@@ -127,6 +148,7 @@ def write_bending_xlsx(A, dec, cfg, title_cn, out_path):
     from .report import joint_meta, LEG_CN, PART_CN
 
     meta = joint_meta(cfg)
+    comps = bend_comp_names(cfg)
     t = A[:, 0]
     wb = Workbook()
     thin = Alignment(horizontal="center", vertical="center")
@@ -135,25 +157,36 @@ def write_bending_xlsx(A, dec, cfg, title_cn, out_path):
 
     ws = wb.active
     ws.title = "关节弯矩时序"
-    ws.append([f"{title_cn} — 各关节弯矩 |M_bend| (N·m, 垂直于转轴合力矩), 每 10 ms 抽样"])
+    ws.append([f"{title_cn} — 各关节弯矩时序 (N·m), 每 10 ms 抽样; "
+               f"每关节3列: |M|=垂直转轴的合成弯矩幅值, 后两列为两个垂直分量(子体局部系)"])
     ws["A1"].font = Font(bold=True, size=12)
     ws.append([])
-    ws.append(["时间(s)"] + [m[0].replace("_joint", "") for m in meta])
+    head = ["时间(s)"]
+    for i, m in enumerate(meta):
+        jn = m[0].replace("_joint", "")
+        head += [f"{jn}_|M|", f"{jn}_{comps[i][0]}", f"{jn}_{comps[i][1]}"]
+    ws.append(head)
     for c in ws[3]:
         c.fill, c.font, c.alignment = hdr_fill, hdr_font, thin
-    for i in range(0, len(t), 5):
-        ws.append([round(float(t[i]), 3)] + [round(float(v), 2) for v in dec["bend"][i]])
+    for r in range(0, len(t), 5):
+        row = [round(float(t[r]), 3)]
+        for i in range(12):
+            row += [round(float(dec["bend"][r, i]), 2),
+                    round(float(dec["bend_c1"][r, i]), 2),
+                    round(float(dec["bend_c2"][r, i]), 2)]
+        ws.append(row)
     ws.freeze_panes = "B4"
     ws.column_dimensions["A"].width = 9
-    for j in range(2, 14):
-        ws.column_dimensions[get_column_letter(j)].width = 11
+    for j in range(2, 38):
+        ws.column_dimensions[get_column_letter(j)].width = 12
 
     ws2 = wb.create_sheet("关节载荷统计")
     ws2.append([f"{title_cn} — 关节结构载荷统计 (全程)"])
     ws2["A1"].font = Font(bold=True, size=12)
     ws2.append([])
-    ws2.append(["关节", "腿", "部位(转轴)", "|驱动力矩|峰值(N·m)", "弯矩峰值(N·m)", "弯矩RMS(N·m)",
-                "弯矩峰值时刻(s)", "|轴向力|峰值(N)", "剪力峰值(N)", "剪力RMS(N)"])
+    ws2.append(["关节", "腿", "部位(转轴)", "|驱动力矩|峰值(N·m)", "弯矩峰值|M|(N·m)", "弯矩RMS(N·m)",
+                "弯矩峰值时刻(s)", "分量1峰值(N·m)", "分量2峰值(N·m)", "|轴向力|峰值(N)",
+                "剪力峰值(N)", "剪力RMS(N)"])
     for c in ws2[3]:
         c.fill, c.font, c.alignment = hdr_fill, hdr_font, thin
     axis_cn = {"hip": "轴x", "thigh": "轴y", "calf": "轴y"}
@@ -164,10 +197,12 @@ def write_bending_xlsx(A, dec, cfg, title_cn, out_path):
                     round(float(dec["bend"][:, i].max()), 1),
                     round(float(np.sqrt((dec["bend"][:, i] ** 2).mean())), 2),
                     round(float(t[ipk]), 2),
+                    f"{comps[i][0]}: {abs(dec['bend_c1'][:, i]).max():.1f}",
+                    f"{comps[i][1]}: {abs(dec['bend_c2'][:, i]).max():.1f}",
                     round(float(np.abs(dec["axial"][:, i]).max()), 1),
                     round(float(dec["shear"][:, i].max()), 1),
                     round(float(np.sqrt((dec["shear"][:, i] ** 2).mean())), 1)])
-    for j, w in enumerate([16, 7, 16, 17, 14, 13, 14, 13, 11, 11], 1):
+    for j, w in enumerate([16, 7, 16, 17, 15, 13, 14, 15, 15, 13, 11, 11], 1):
         ws2.column_dimensions[get_column_letter(j)].width = w
     ws2.freeze_panes = "A4"
     wb.properties.creator = "quad_pipeline"

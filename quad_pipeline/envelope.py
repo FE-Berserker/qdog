@@ -88,7 +88,9 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
         ws.column_dimensions[get_column_letter(j)].width = w
     ws.freeze_panes = "A4"
 
-    for m, sheet, unit in (("bend", "弯矩峰值矩阵", "N·m"), ("shear", "剪力峰值矩阵", "N")):
+    for m, sheet, unit in (("drive", "驱动力矩峰值矩阵", "N·m"),
+                           ("bend", "弯矩峰值矩阵", "N·m"),
+                           ("shear", "剪力峰值矩阵", "N")):
         wsm = wb.create_sheet(sheet)
         wsm.append([f"工况 × 关节 {sheet[:-2]} ({unit})"])
         wsm["A1"].font = Font(bold=True, size=12)
@@ -118,40 +120,46 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
     wb.properties.creator = "quad_pipeline"
     out_xlsx = _safe_save(wb.save, out_xlsx)
 
-    # ---- 图: 热力图 + 包络柱状 ----
+    # ---- 图: 弯矩热力图 + 驱动力矩热力图 + 包络柱状 ----
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    M = np.array([[data[k]["bend"][i] for i in range(nj)] for k in keys])
     jn_short = [mm[0].replace("_joint", "") for mm in meta]
-    fig, axes = plt.subplots(2, 1, figsize=(15, 10), height_ratios=[1, 1.1])
-    im = axes[0].imshow(M, aspect="auto", cmap="OrRd")
-    axes[0].set_yticks(range(len(keys)), [case_names[keys.index(k)] for k in keys])
-    axes[0].set_xticks(range(nj), jn_short, rotation=45, ha="right", fontsize=8)
-    for a in range(len(keys)):
-        for b in range(nj):
-            axes[0].text(b, a, f"{M[a, b]:.0f}", ha="center", va="center", fontsize=7,
-                         color="white" if M[a, b] > M.max() * 0.6 else "black")
-    axes[0].set_title("关节弯矩峰值热力图 (N·m, 工况×关节)")
-    fig.colorbar(im, ax=axes[0], shrink=0.85, label="N·m")
+
+    def heatmap(ax, M, title, cmap):
+        im = ax.imshow(M, aspect="auto", cmap=cmap)
+        ax.set_yticks(range(len(keys)), [case_names[keys.index(k)] for k in keys])
+        ax.set_xticks(range(nj), jn_short, rotation=45, ha="right", fontsize=8)
+        for a in range(len(keys)):
+            for b in range(nj):
+                ax.text(b, a, f"{M[a, b]:.0f}", ha="center", va="center", fontsize=7,
+                        color="white" if M[a, b] > M.max() * 0.6 else "black")
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, shrink=0.85, label="N·m")
+
+    M_bend = np.array([[data[k]["bend"][i] for i in range(nj)] for k in keys])
+    M_drive = np.array([[data[k]["drive"][i] for i in range(nj)] for k in keys])
+    fig, axes = plt.subplots(3, 1, figsize=(15, 14), height_ratios=[1, 1, 1.1])
+    heatmap(axes[0], M_bend, "关节弯矩峰值热力图 (N·m, 工况×关节)", "OrRd")
+    heatmap(axes[1], M_drive, "关节|驱动力矩|峰值热力图 (N·m, 工况×关节)", "Blues")
 
     x = np.arange(nj)
-    axes[1].bar(x - 0.2, env["drive"], 0.4, label="|驱动力矩|包络", color="#1f5fa8")
-    axes[1].bar(x + 0.2, env["bend"], 0.4, label="弯矩包络", color="#a8332a")
+    axes[2].bar(x - 0.2, env["drive"], 0.4, label="|驱动力矩|包络", color="#1f5fa8")
+    axes[2].bar(x + 0.2, env["bend"], 0.4, label="弯矩包络", color="#a8332a")
     for i in range(nj):
-        axes[1].text(x[i] + 0.2, env["bend"][i] + 2, src["bend"][i], ha="center",
+        axes[2].text(x[i] + 0.2, env["bend"][i] + 2, src["bend"][i], ha="center",
                      fontsize=7, rotation=90, color="#a8332a")
-        axes[1].text(x[i] - 0.2, env["drive"][i] + 2, src["drive"][i], ha="center",
+        axes[2].text(x[i] - 0.2, env["drive"][i] + 2, src["drive"][i], ha="center",
                      fontsize=7, rotation=90, color="#1f5fa8")
-    axes[1].set_xticks(x, jn_short, rotation=45, ha="right", fontsize=8)
-    axes[1].set_ylabel("N·m")
-    axes[1].set_title("关节载荷包络 (各工况取最大; 标注=来源工况)")
-    axes[1].legend()
-    axes[1].grid(alpha=0.3, axis="y")
-    axes[1].set_xlim(-0.6, nj - 0.4)
+    axes[2].set_xticks(x, jn_short, rotation=45, ha="right", fontsize=8)
+    axes[2].set_ylabel("N·m")
+    axes[2].set_title("关节载荷包络 (各工况取最大; 标注=来源工况)")
+    axes[2].legend()
+    axes[2].grid(alpha=0.3, axis="y")
+    axes[2].set_xlim(-0.6, nj - 0.4)
     fig.tight_layout()
     out_png = out_dir / "关节载荷包络.png"
     out_png = _safe_save(lambda p: fig.savefig(p, dpi=140), out_png)
