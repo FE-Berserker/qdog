@@ -1,0 +1,7 @@
+mujoco>=3.0
+numpy
+matplotlib
+openpyxl
+pillow
+# 可选: 有 imageio-ffmpeg 或系统 ffmpeg 时, 视频会额外转码一份 MP4
+# imageio-ffmpeg
