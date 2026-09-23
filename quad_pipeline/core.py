@@ -46,15 +46,21 @@ def _abs(p):
     return str(p if p.is_absolute() else WORKSPACE / p)
 
 
-def build_scene(cfg: RobotConfig, out_dir: Path):
-    """生成场景 xml (绝对路径引用模型与网格, 与结果目录位置无关)。"""
+def build_scene(cfg: RobotConfig, out_dir: Path, extra: str = "", name: str = "scene.xml"):
+    """生成场景 xml (绝对路径引用模型与网格, 与结果目录位置无关)。
+
+    extra: 追加在 </mujoco> 前的定制片段 (如堵转工况的 equality 焊接),
+    非空时应给不同的 name 以免覆盖共享场景。"""
     out_dir.mkdir(parents=True, exist_ok=True)
-    scene = out_dir / "scene.xml"
-    scene.write_text(SCENE_TMPL.format(
+    xml = SCENE_TMPL.format(
         model_name=f"{cfg.name}_scene",
         model_xml_abs=_abs(cfg.model_xml).replace("\\", "/"),
         mesh_dir_abs=_abs(cfg.mesh_dir).replace("\\", "/"),
-    ), encoding="utf-8")
+    )
+    if extra:
+        xml = xml.replace("</mujoco>", extra + "\n</mujoco>")
+    scene = out_dir / name
+    scene.write_text(xml, encoding="utf-8")
     return scene
 
 
@@ -68,10 +74,18 @@ class CaseSimBase:
 
     cfg: RobotConfig。model: 可注入传感器增强模型 (弯矩提取时重放用)。
     跌倒判定阈值 Z_LO/ATT_LIM 可在子类覆盖 (如前扑/跌落)。
+
+    工况维度 (子类覆盖, 构成"工况 × 负载 × 地形"矩阵):
+      PAYLOAD   躯干附加负载 kg, 按紧凑货载贴近躯干质心建模 (0=空载)
+      SLOPE_DEG 等效坡度角 deg; 重力矢量倾斜法: 地面几何保持平地,
+                重力向 -x 倾斜, 与上坡在力学上严格等价 (均匀无限坡面),
+                视频中"平地 + 机身前倾"即爬坡姿态
     """
 
     Z_LO = 0.28
     ATT_LIM = 0.7
+    PAYLOAD = 0.0
+    SLOPE_DEG = 0.0
 
     def __init__(self, cfg: RobotConfig, model=None, scene=None):
         self.cfg = cfg
@@ -103,6 +117,7 @@ class CaseSimBase:
             self.foot_geoms[lg] = [g for g in range(m.ngeom)
                                    if m.geom_bodyid[g] == foot
                                    and m.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
+        self.trunk_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, cfg.trunk_body)
         self.ctrl_hi = m.actuator_ctrlrange[:, 1].copy()
         self.ctrl_lo = m.actuator_ctrlrange[:, 0].copy()
         self.jrange = {n: m.jnt_range[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)]
@@ -113,7 +128,8 @@ class CaseSimBase:
         self.kp_sw = np.array([[60.0, 110.0, 220.0][i % 3] for i in range(12)])
         self.kd_sw = np.array([[2.0, 4.0, 6.0][i % 3] for i in range(12)])
         if cfg.mass <= 0:
-            cfg.mass = float(sum(m.body_mass))
+            cfg.mass = float(sum(m.body_mass))   # 基准自重 (不含附加负载)
+        self._apply_case_conditions(m)
         self.t = 0.0
         self.stance = {lg: True for lg in cfg.legs}
         self.x_td_lat = {lg: 0.0 for lg in cfg.legs}
@@ -121,6 +137,18 @@ class CaseSimBase:
         self.vcmd_now = 0.0
         self.fallen = False
         self._twin = mujoco.MjData(m)
+
+    def _apply_case_conditions(self, m):
+        """按类属性施加负载与等效坡度; 普通仿真与 wrench 传感器模型重放共用。"""
+        if self.PAYLOAD > 0.0:
+            if self.trunk_bid < 0:
+                raise ValueError(f"躯干体 {self.cfg.trunk_body!r} 不存在, 请检查 trunk_body 配置")
+            m.body_mass[self.trunk_bid] += self.PAYLOAD
+            # 惯量增量: 按边长 10 cm 的紧凑箱体 (I = m·s²/6), 重量效应为主, 此项为二阶修正
+            m.body_inertia[self.trunk_bid] += self.PAYLOAD * 0.1 ** 2 / 6.0
+        if self.SLOPE_DEG != 0.0:
+            th = np.radians(self.SLOPE_DEG)
+            m.opt.gravity[:] = (-G * np.sin(th), 0.0, -G * np.cos(th))
 
     # ---- 运动学 ----
     def ik2r(self, ux, uz):

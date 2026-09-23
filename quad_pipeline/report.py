@@ -8,7 +8,8 @@ from .core import C_TQ, C_FZ, C_ST, C_VX, C_VCMD, C_BX, C_BZ, G
 from .config import RobotConfig
 
 LEG_CN = {"FL": "左前", "FR": "右前", "RL": "左后", "RR": "右后"}
-PART_CN = {"hip": "髋外展", "thigh": "大腿(髋俯仰)", "calf": "小腿(膝)"}
+PART_CN = {"hip": "髋外展(1#)", "thigh": "大腿(髋俯仰)(2#)", "calf": "小腿(膝)(3#)"}
+PART_NO = {"hip": "1#", "thigh": "2#", "calf": "3#"}   # 关节序号 (叙述用: 1/2/3号关节)
 
 
 def joint_meta(cfg: RobotConfig):
@@ -24,6 +25,9 @@ def joint_meta(cfg: RobotConfig):
 def summarize(A, cfg, win):
     t = A[:, 0]
     mask = (t >= win[0]) & (t <= win[1])
+    if not mask.any():
+        # 仿真提前截断 (跌倒/姿态超限) 落在统计窗口之前: 退化为全部样本
+        mask = np.ones(len(t), dtype=bool)
     tq = A[:, C_TQ:C_TQ + 12]
     grf = A[:, C_FZ:C_FZ + 4]
     st = A[:, C_ST:C_ST + 4]
@@ -71,7 +75,7 @@ def make_plots(A, cfg, title_cn, out_torques, out_motion, win):
         ax.axhline(-rated, color="r", ls="--", lw=0.7)
         if win:
             ax.axvspan(win[0], min(win[1], t[-1]), color="#2a7a3a", alpha=0.06)
-        ax.set_title(f"{jn}  (额定±{rated:.0f} N·m)", fontsize=9)
+        ax.set_title(f"{jn}({PART_NO[p]})  (额定±{rated:.0f} N·m)", fontsize=9)
         ax.grid(alpha=0.3)
         ax.set_ylabel("N·m", fontsize=8)
     for ax in axes[3]:
@@ -127,6 +131,8 @@ def write_torque_xlsx(A, cfg, stats, title_cn, desc, win, out_path):
     t = A[:, 0]
     tq = A[:, C_TQ:C_TQ + 12]
     mask = (t >= win[0]) & (t <= win[1])
+    if not mask.any():
+        mask = np.ones(len(t), dtype=bool)   # 提前截断: 退化为全部样本
     tq_w, t_w = tq[mask], t[mask]
 
     ws = wb.active
@@ -162,7 +168,7 @@ def write_torque_xlsx(A, cfg, stats, title_cn, desc, win, out_path):
                     f"{stats['peak_tq'][i] / rated * 100:.0f}%",
                     round(float(t_w[ipeak]), 2),
                     "未超限" if stats["peak_tq"][i] <= rated else "超出额定, 执行器已限幅"])
-    for j, w in enumerate([16, 7, 14, 13, 13, 13, 14, 9, 13, 13, 11, 11, 22], 1):
+    for j, w in enumerate([16, 7, 18, 13, 13, 13, 14, 9, 13, 13, 11, 11, 22], 1):
         ws2.column_dimensions[get_column_letter(j)].width = w
     ws2.freeze_panes = "A4"
 

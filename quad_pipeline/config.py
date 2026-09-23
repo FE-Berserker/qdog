@@ -21,6 +21,7 @@ class RobotConfig:
     act_fmt: str = "{leg}_{part}"
     body_fmt: str = "{leg}_{part}"
     foot_body_fmt: str = "{leg}_calf"      # 足端碰撞球所在体
+    trunk_body: str = "base_link"          # 躯干体名 (附加负载挂载体)
     # 关节轴 (子体局部系, 用于弯矩分解): 宇树系 hip 绕 x, thigh/calf 绕 y
     part_axis: dict = field(default_factory=lambda: {
         "hip": (1.0, 0.0, 0.0), "thigh": (0.0, 1.0, 0.0), "calf": (0.0, 1.0, 0.0)})

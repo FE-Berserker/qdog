@@ -1,4 +1,4 @@
-"""quad_pipeline 动作库: 行走 / 奔跑 / 跳跃 / 前扑 / 跌落。
+"""quad_pipeline 动作库: 行走 / 奔跑 / 跳跃 / 前扑 / 跌落 + 载荷地形工况。
 
 每个动作 = 一个 CaseSimBase 子类 (init_pose + step) + 元数据注册 (MOTIONS)。
 参数均为 A2 实机调定值; 换机型时在子类 PARAMS 基础上派生覆盖即可。
@@ -9,6 +9,18 @@
   jump  原地跳跃, 起跳 vz≈2.0 m/s, 落地缓冲
   leap  前扑 v2, 起跳 vx=0.71/vz=1.58, 腾空 0.34 s 前进 0.24 m, 前腿落地缓冲
   drop  0.30 m 自由跌落, 触地 GRF 峰值 ≈ 4.7 kN (11.9 倍体重)
+
+载荷/地形工况 (按设计工况矩阵扩展, 负载/坡度为类属性, 变体即新工况):
+  walk_full   满载行走: 平地 walk + 25 kg 躯干负载 (A2 持续行走负载)
+  slope       爬坡: 20° 等效上坡 (重力矢量倾斜法), 实测上行 0.17 m/s
+  slope_full  满载爬坡: 15° + 25 kg, 实测上行 0.42 m/s —— 额定扭矩与热平衡
+              的决定性持续工况 (坡度/速度受时钟步态扭矩预算限制, 见 DESC)
+  stand_load  静站载重: 站立保持 + 100 kg (A2 站立最大负载), 结构静强度工况
+
+异常/失效工况 (A2, 2026-09 实仿):
+  push  侧向推搡: trot 中躯干 50 N×0.25 s 侧向冲击, 姿态峰峰值 9.0°/4.3°, 恢复
+  fall  侧跌倒落: 0.30 m+25° 侧倾非受控跌落, 触地 GRF 峰值 1905 N (~4.8 倍体重)
+  stall 关节堵转: FL 膝 equality 焊接卡滞+下蹲, FL_calf 持续饱和 180 N·m (执行器限幅)
 """
 
 import mujoco
@@ -38,10 +50,15 @@ class WalkMotion(CaseSimBase):
     T_SETTLE, T_RAMP = 0.8, 1.2
     K_PITCH, K_PITCHD = 0.10, 0.03
     K_ROLL, K_ROLLD = 0.10, 0.03
+    R_ST = None              # 站姿腿长覆盖 (坡道蹲低降质心)
+    XC_LIM = 0.12            # 速度反馈足端修正限幅 (坡道需加大抗后滑)
+    XA_BOOST = 1.0           # 扫腿幅值前馈系数 (坡道补偿系统性速度缺口+重力拖拽)
 
     def __init__(self, cfg, model=None, scene=None):
         super().__init__(cfg, model=model, scene=scene)
         self.PHASE0 = {"FR": 0.0, "RL": 0.25, "FL": 0.5, "RR": 0.75}
+        self.r_st = self.R_ST or cfg.r_stand
+        self.x_grav = 0.0      # 足端支撑中心前馈偏移 (坡度补偿在子类设置)
 
     def v_cmd(self):
         if self.t < self.T_SETTLE:
@@ -55,7 +72,7 @@ class WalkMotion(CaseSimBase):
 
     def init_pose(self):
         q0 = np.zeros(self.model.nq)
-        self.stand_pose(q0)
+        self.stand_pose(q0, r=self.r_st, x=self.x_grav)
         self.data.qpos[:] = q0
         mujoco.mj_forward(self.model, self.data)
 
@@ -65,14 +82,14 @@ class WalkMotion(CaseSimBase):
         roll, pitch = self.body_rpy()
         roll_r, pitch_r = d.qvel[3], d.qvel[4]
         T_st = self.DUTY * self.GAIT_T
-        x_a = float(np.clip(0.5 * max(vcmd, 0.05) * T_st, 0.02, 0.26))
-        x_c = float(np.clip(self.K_FB * (v_x - vcmd), -0.12, 0.12))
+        x_a = float(np.clip(0.5 * max(vcmd, 0.05) * T_st * self.XA_BOOST, 0.02, 0.26))
+        x_c = float(np.clip(self.K_FB * (v_x - vcmd), -self.XC_LIM, self.XC_LIM)) + self.x_grav
         q_tgt = np.zeros(12)
         kp = np.zeros(12)
         kd = np.zeros(12)
         for li, lg in enumerate(self.cfg.legs):
             x_f, z_f, st = self.foot_target(lg, x_a, x_c, self.GAIT_T, self.DUTY,
-                                            self.STEP_H, self.cfg.r_stand,
+                                            self.STEP_H, self.r_st,
                                             self.PHASE0, self.T_SETTLE)
             depth = -z_f
             if st:
@@ -411,3 +428,175 @@ class DropMotion(CaseSimBase):
         kd_scale = 3.0 if self.phase == "absorb" else 1.0
         self.apply_pd(q_tgt, self.kp_st, self.kd_st * kd_scale)
         self.mark_stance_by_contact(ff)
+
+
+# ============================================================ 载荷/地形工况
+# 按设计工况矩阵扩展: 负载 (PAYLOAD) 与坡度 (SLOPE_DEG) 为类属性, 派生即新工况。
+# 负载值取自 A2 规格书 (持续行走 25 kg / 站立最大 100 kg), 换机型在子类覆盖。
+# 注意: 支撑相关节扭矩来自地面反力而非 segment 自重 (重力前馈在此处无效),
+# 重载保持类工况需加大 PD 刚度以顶住 3 倍以上的整机重量。
+
+
+@motion("walk_full", "满载行走",
+        "平地四节拍行走 + 躯干满载 25 kg (A2 持续行走负载), 额定扭矩/热平衡工况",
+        t_end=8.0, win=(2.8, 8.0))
+class WalkFullMotion(WalkMotion):
+    PAYLOAD = 25.0
+
+
+@motion("slope", "爬坡",
+        "20° 等效上坡四节拍行走 (重力矢量倾斜法), 实测上行 0.17 m/s; "
+        "时钟步态在 30° 因执行器饱和无法持续上行, 故定 20°",
+        t_end=8.0, win=(2.8, 8.0))
+class SlopeMotion(WalkMotion):
+    SLOPE_DEG = 20.0
+    V_MAX = 0.3
+    GAIT_T = 0.6         # 提高步频补偿拖拽损耗
+    XA_BOOST = 1.15      # 扫腿幅值前馈 (系统性速度缺口 + 坡道拖拽)
+    KP_SCALE = 2.0       # 支撑刚度加倍: 抵抗重力拖拽造成的伺服屈服
+    K_FB = 0.25
+    XC_LIM = 0.18
+    R_ST = 0.38          # 蹲低站姿降低质心
+
+    def __init__(self, cfg, model=None, scene=None):
+        super().__init__(cfg, model=model, scene=scene)
+        self.kp_st = self.kp_st * self.KP_SCALE
+        self.kd_st = self.kd_st * np.sqrt(self.KP_SCALE)
+        # 上坡姿态前馈: 足端支撑中心沿坡下移 r·tanθ, 等效重力线落在支撑多边形内
+        # (机身相对足端前倾"迎坡", 与真机爬坡姿态一致)
+        self.x_grav = -self.r_st * float(np.tan(np.radians(self.SLOPE_DEG)))
+
+
+@motion("slope_full", "满载爬坡",
+        "15° 上坡 + 满载 25 kg, 实测上行 0.42 m/s: 额定扭矩与热平衡的决定性持续工况 "
+        "(更大坡度+满载超出时钟步态扭矩预算, 降至 15°)",
+        t_end=8.0, win=(2.8, 8.0))
+class SlopeFullMotion(SlopeMotion):
+    PAYLOAD = 25.0
+    SLOPE_DEG = 15.0
+    V_MAX = 0.6
+
+
+@motion("stand_load", "静站载重",
+        "站立保持 + 躯干静载 100 kg (A2 站立最大负载), 结构静强度工况",
+        t_end=3.0, win=(1.0, 3.0))
+class StandLoadMotion(CaseSimBase):
+    PAYLOAD = 100.0
+
+    def __init__(self, cfg, model=None, scene=None):
+        super().__init__(cfg, model=model, scene=scene)
+        # 140 kg 整机重需高刚度保持 (常规行走增益会被自重压沉)
+        self.kp_st = np.array([[400.0, 500.0, 800.0][i % 3] for i in range(12)])
+        self.kd_st = np.array([[10.0, 15.0, 24.0][i % 3] for i in range(12)])
+
+    def init_pose(self):
+        q0 = np.zeros(self.model.nq)
+        self.stand_pose(q0)
+        self.data.qpos[:] = q0
+        mujoco.mj_forward(self.model, self.data)
+
+    def step(self):
+        q_tgt = np.zeros(12)
+        for li, lg in enumerate(self.cfg.legs):
+            th1, th2 = self.ik2r(0.0, -self.cfg.r_stand)
+            q_tgt[li * 3 + 1] = th1
+            q_tgt[li * 3 + 2] = th2
+        self.apply_pd(q_tgt, self.kp_st, self.kd_st)
+
+
+# ============================================================ 异常/失效工况
+# 可靠性设计与安全功能的输入 (设计工况统计第④类): 抗扰裕度 / 结构抗摔 / 驱动器保护。
+
+
+@motion("push", "侧向推搡",
+        "对角小跑中躯干侧面施加 50 N×0.25 s 冲击 (参考 58 kg 平台 Trot 抗扰试验), "
+        "校核关节峰值扭矩储备与稳定裕度",
+        t_end=8.0, win=(2.8, 8.0))
+class PushMotion(TrotMotion):
+    PUSH_T0, PUSH_T1 = 4.0, 4.25           # 冲击施加窗口 s
+    PUSH_F = (0.0, 50.0, 0.0)              # 世界系侧向力 N
+
+    def apply_pd(self, q_tgt, kp, kd):
+        # xfrc_applied 跨步保持, 须每步重写 (施加/清零)
+        self.data.xfrc_applied[self.trunk_bid] = 0.0
+        if self.PUSH_T0 <= self.t <= self.PUSH_T1:
+            self.data.xfrc_applied[self.trunk_bid][:3] = self.PUSH_F
+        super().apply_pd(q_tgt, kp, kd)
+
+
+@motion("fall", "侧跌倒落",
+        "0.30 m 高度带 25° 初始侧倾自由跌落, 站立 PD 保持 (实机跌落时控制器仍在跑), "
+        "非受控结构抗摔冲击工况",
+        t_end=2.5, win=(0.0, 2.0))
+class FallMotion(CaseSimBase):
+    Z_LO = 0.10
+    ATT_LIM = 1.4                          # 允许大角度翻滚, 充分记录冲击过程
+    DROP_H = 0.30
+    ROLL0 = 25.0                           # 初始侧倾角 deg (绕 x 轴)
+
+    def init_pose(self):
+        q0 = np.zeros(self.model.nq)
+        self.stand_pose(q0)
+        q0[2] = self.cfg.foot_r + self.cfg.r_stand + self.DROP_H
+        th = np.radians(self.ROLL0)
+        q0[3:7] = [np.cos(th / 2), np.sin(th / 2), 0.0, 0.0]
+        self.data.qpos[:] = q0
+        mujoco.mj_forward(self.model, self.data)
+
+    def step(self):
+        q_tgt = np.zeros(12)
+        for li, lg in enumerate(self.cfg.legs):
+            th1, th2 = self.ik2r(0.0, -self.cfg.r_stand)
+            q_tgt[li * 3 + 1] = th1
+            q_tgt[li * 3 + 2] = th2
+        self.apply_pd(q_tgt, self.kp_st, self.kd_st)
+        self.mark_stance_by_contact(self.foot_forces())
+
+
+@motion("stall", "关节堵转",
+        "站立中 FL 膝关节机械卡滞 (equality 焊接, 反力由约束求解承担) + 缓慢下蹲施压, "
+        "执行器持续饱和: 堵转过流/驱动器 I2t 热保护工况",
+        t_end=4.0, win=(1.0, 4.0))
+class StallMotion(CaseSimBase):
+    T_JAM = 0.8                            # 卡滞发生时刻 s
+    JAM_LEG, JAM_PART = "FL", "calf"       # 卡滞关节 (踩缝卡膝场景)
+    R_SQUAT = 0.30                         # 卡滞后下蹲目标腿长 m
+    T_SQUAT = 2.0                          # 下蹲到位时刻 s
+    # 定制场景: 焊接 FL_calf 到常量 (初始 inactive, T_JAM 时激活并锁到当前角)
+    SCENE_EXTRA = ('<equality>\n'
+                   '  <joint name="jam_FL_calf" joint1="FL_calf_joint" active="false"/>\n'
+                   '</equality>')
+
+    def __init__(self, cfg, model=None, scene=None):
+        super().__init__(cfg, model=model, scene=scene)
+        self.jammed = False
+        self.jam_joint = cfg.joint_fmt.format(leg=self.JAM_LEG, part=self.JAM_PART)
+        self.jam_eq = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, "jam_FL_calf")
+        # 堵转需高刚度施压至执行器饱和 (与跳跃版一致)
+        self.kp_st = np.array([[120.0, 260.0, 600.0][i % 3] for i in range(12)])
+        self.kd_st = np.array([[3.0, 6.0, 10.0][i % 3] for i in range(12)])
+
+    def init_pose(self):
+        q0 = np.zeros(self.model.nq)
+        self.stand_pose(q0)
+        self.data.qpos[:] = q0
+        mujoco.mj_forward(self.model, self.data)
+
+    def step(self):
+        d = self.data
+        if not self.jammed and self.t >= self.T_JAM:
+            # 机械卡滞: 焊接约束激活, 锁定常量 = 当前关节角
+            self.model.eq_data[self.jam_eq, 0] = d.qpos[self.jq[self.jam_joint]]
+            d.eq_active[self.jam_eq] = 1
+            self.jammed = True
+        if self.t < self.T_JAM:
+            r = self.cfg.r_stand
+        else:
+            u = smoothstep((self.t - self.T_JAM) / (self.T_SQUAT - self.T_JAM))
+            r = self.cfg.r_stand + (self.R_SQUAT - self.cfg.r_stand) * u
+        q_tgt = np.zeros(12)
+        for li, lg in enumerate(self.cfg.legs):
+            th1, th2 = self.ik2r(0.0, -r)
+            q_tgt[li * 3 + 1] = th1
+            q_tgt[li * 3 + 2] = th2
+        self.apply_pd(q_tgt, self.kp_st, self.kd_st)

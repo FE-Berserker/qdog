@@ -119,6 +119,7 @@ def make_bending_png(A, dec, cfg, title_cn, out_path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from .report import PART_NO
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
     jn_list = [cfg.joint_fmt.format(leg=lg, part=p) for lg in cfg.legs for p in cfg.parts]
@@ -128,7 +129,7 @@ def make_bending_png(A, dec, cfg, title_cn, out_path):
         ax = axes[i // 3, i % 3]
         ax.plot(t, dec["bend"][:, i], lw=0.8, color="#a8332a", label="|弯矩|")
         ax.plot(t, np.abs(dec["drive"][:, i]), lw=0.7, ls="--", color="#1f5fa8", label="|绕轴驱动|")
-        ax.set_title(jn_list[i], fontsize=9)
+        ax.set_title(f"{jn_list[i]}({PART_NO[cfg.parts[i % 3]]})", fontsize=9)
         ax.grid(alpha=0.3)
         ax.set_ylabel("N·m", fontsize=8)
         if i == 0:
@@ -202,7 +203,7 @@ def write_bending_xlsx(A, dec, cfg, title_cn, out_path):
                     round(float(np.abs(dec["axial"][:, i]).max()), 1),
                     round(float(dec["shear"][:, i].max()), 1),
                     round(float(np.sqrt((dec["shear"][:, i] ** 2).mean())), 1)])
-    for j, w in enumerate([16, 7, 16, 17, 15, 13, 14, 15, 15, 13, 11, 11], 1):
+    for j, w in enumerate([16, 7, 20, 17, 15, 13, 14, 15, 15, 13, 11, 11], 1):
         ws2.column_dimensions[get_column_letter(j)].width = w
     ws2.freeze_panes = "A4"
     wb.properties.creator = "quad_pipeline"

@@ -43,8 +43,15 @@ def make_cameras():
 
 
 def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
-                 fps=50, stride=None, checks=True):
-    """从轨迹 npy 渲染视频。返回 (avi_path, gif_path, [check_pngs])。"""
+                 fps=50, stride=None, checks=True, slope_deg=0.0, payload_kg=0.0):
+    """从轨迹 npy 渲染视频。返回 (avi_path, gif_path, [check_pngs])。
+
+    slope_deg>0 (爬坡工况): 物理用重力倾斜法 (平地+斜重力), 渲染时把整机位姿
+    反向刚体旋转 R_y(-θ) 并在场景中放入斜坡障碍物 —— 与真实上坡视角严格等价,
+    足端与坡面接触位置精确吻合, 仅用于可视化, 不影响物理。
+
+    payload_kg>0 (负载工况): 在躯干上挂一个纯视觉货箱 (无碰撞/无质量),
+    尺寸按质量立方根缩放 (以 25 kg 为基准), 满载/静载直观可读。"""
     from PIL import Image, ImageDraw
 
     A = np.load(trace_path)
@@ -53,10 +60,43 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
     st_all = A[:, C_ST:C_ST + 4]
     stride = stride or max(1, int(round(500 / fps)))
 
-    model = mujoco.MjModel.from_xml_path(str(scene_path))
+    th = np.radians(slope_deg)
+    sn, cs = np.sin(th), np.cos(th)
+    if slope_deg > 0.0 or payload_kg > 0.0:
+        spec = mujoco.MjSpec.from_file(str(scene_path))
+        if payload_kg > 0.0:
+            # 背上货箱 (挂躯干随动): 25 kg 基准箱 0.24×0.20×0.18 m
+            sc = (payload_kg / 25.0) ** (1.0 / 3.0)
+            hx, hy, hz = 0.12 * sc, 0.10 * sc, 0.09 * sc
+            spec.body(cfg.trunk_body).add_geom(
+                name="payload_crate", type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[hx, hy, hz], pos=[0.0, 0.0, 0.13 + hz],
+                rgba=[0.72, 0.48, 0.24, 1.0], contype=0, conaffinity=0)
+        if slope_deg > 0.0:
+            # 斜坡障碍物: 顶面 = 旋转后的地板面 (整体上抬 h0, 下坡端埋入平地)
+            h0 = 2.2 * sn / cs
+            sx, sy, sz = 3.0, 1.4, 1.0           # 半长/半宽/半厚
+            px, pz = 0.3, 0.3 * sn / cs + h0     # 坡顶面中心点 (机器人活动区上方)
+            gx, gz = px + sz * sn, pz - sz * cs  # 盒中心 = 面点 - 半厚×法向(-sn,0,cs)
+            # 姿态用四元数 (a2.xml compiler 为 radian, euler/axisangle 单位不可靠)
+            qw_b, qy_b = np.cos(th / 2), -np.sin(th / 2)
+            spec.worldbody.add_geom(
+                name="ramp", type=mujoco.mjtGeom.mjGEOM_BOX, size=[sx, sy, sz],
+                pos=[gx, 0.0, gz], quat=[qw_b, 0.0, qy_b, 0.0],
+                rgba=[0.45, 0.42, 0.40, 1.0], contype=0, conaffinity=0)
+        model = spec.compile()
+    else:
+        model = mujoco.MjModel.from_xml_path(str(scene_path))
     data = mujoco.MjData(model)
+    if cfg.mass <= 0:
+        # 独立渲染 (未经仿真) 时 cfg.mass 未初始化: 从模型求和 (基准自重)
+        cfg.mass = float(sum(model.body_mass))
     renderer = mujoco.Renderer(model, height=PANEL_H, width=PANEL_W)
     cams = make_cameras()
+    if slope_deg > 0.0:
+        # 坡面视角: 侧视拉远含整段坡; 3/4 改到前下方 (默认角度会被坡体遮挡)
+        cams[0][1].distance = 3.0
+        cams[1][1].azimuth, cams[1][1].elevation, cams[1][1].distance = 60, -5, 3.0
     f_big, f_mid, f_small = find_font(30), find_font(22), find_font(17)
     col = (40, 130, 80)
 
@@ -67,10 +107,19 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
         bx, by, bz = float(A[k, C_BX]), float(A[k, C_BY]), float(A[k, C_BZ])
         vx, vcmd = float(A[k, C_VX]), float(A[k, C_VCMD])
         data.qpos[:] = q
+        if slope_deg > 0.0:
+            # 整机刚体旋转 R_y(-θ) 到真实坡面视角 (足端精确落在坡面)
+            x, z = data.qpos[0], data.qpos[2]
+            data.qpos[0] = cs * x - sn * z
+            data.qpos[2] = sn * x + cs * z + h0
+            qw, qx, qy, qzq = data.qpos[3:7]
+            ch, sh = np.cos(th / 2), np.sin(th / 2)
+            data.qpos[3:7] = [ch * qw + sh * qy, ch * qx - sh * qzq,
+                              ch * qy - sh * qw, ch * qzq + sh * qx]
         mujoco.mj_forward(model, data)
         canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (24, 26, 30))
         for i, (cname, cam) in enumerate(cams):
-            cam.lookat[:] = [bx, by, 0.40]
+            cam.lookat[:] = [data.qpos[0], data.qpos[1], data.qpos[2] - (bz - 0.40)]
             renderer.update_scene(data, cam)
             canvas.paste(Image.fromarray(renderer.render()), (i * PANEL_W, 0))
             d = ImageDraw.Draw(canvas)

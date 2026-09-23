@@ -3,8 +3,9 @@
 一个命令跑完某机型的全部动作: 仿真 -> 关节扭矩表/图 -> 弯矩提取 -> 视频 -> 载荷包络。
 
 用法:
-  python run_pipeline.py                     # A2 全 5 动作全流程
+  python run_pipeline.py                     # A2 全部已注册动作全流程
   python run_pipeline.py --robot a2 --motions walk trot
+  python run_pipeline.py --motions slope_full stand_load   # 只跑载荷/地形工况
   python run_pipeline.py --skip-video        # 跳过视频渲染 (节省时间)
   python run_pipeline.py --list              # 列出已注册机型与动作
 
@@ -50,6 +51,11 @@ def process_motion(key, cfg, scene, out_root, do_video=True):
     mdir.mkdir(parents=True, exist_ok=True)
     title = f"{cfg.name} {cls.CN}"
 
+    # 动作定制场景 (如堵转焊接 equality); 默认共享场景
+    extra = getattr(cls, "SCENE_EXTRA", "")
+    if extra:
+        scene = build_scene(cfg, out_root, extra, f"scene_{key}.xml")
+
     print(f"\n===== [{key}] {cls.CN} 仿真 =====")
     t0 = time.time()
     sim = cls(cfg, scene=scene)
@@ -76,7 +82,9 @@ def process_motion(key, cfg, scene, out_root, do_video=True):
         print(f"[{key}] 视频渲染...")
         t0 = time.time()
         avi, gif, _ = video.render_video(cfg, mdir / "trace.npy", scene, cls.CN,
-                                         mdir / "video.avi")
+                                         mdir / "video.avi",
+                                         slope_deg=getattr(cls, "SLOPE_DEG", 0.0),
+                                         payload_kg=getattr(cls, "PAYLOAD", 0.0))
         print(f"视频完成 ({time.time() - t0:.0f}s): {avi.name} ({avi.stat().st_size // 1024} KB)")
     else:
         avi = mdir / "video.avi"
@@ -87,7 +95,7 @@ def main():
     ap = argparse.ArgumentParser(description="四足机器狗动作仿真与关节载荷流水线")
     ap.add_argument("--robot", default="a2", help="已注册机型 (config.py)")
     ap.add_argument("--motions", nargs="+", default=None,
-                    help="动作子集 (默认全部: walk trot jump leap drop)")
+                    help="动作子集 (默认全部已注册动作, --list 查看)")
     ap.add_argument("--skip-video", action="store_true", help="跳过视频渲染")
     ap.add_argument("--envelope-only", action="store_true",
                     help="不重跑仿真, 仅用已有数据重建载荷包络")

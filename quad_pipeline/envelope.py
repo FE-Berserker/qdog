@@ -7,7 +7,7 @@ import numpy as np
 
 from .config import RobotConfig
 from .wrench import decompose
-from .report import joint_meta, LEG_CN, PART_CN
+from .report import joint_meta, LEG_CN, PART_CN, PART_NO
 
 METRICS = ["drive", "bend", "bend_rms", "axial", "shear"]
 METRIC_CN = {"drive": "|驱动力矩|峰值(N·m)", "bend": "弯矩峰值(N·m)", "bend_rms": "弯矩RMS(N·m)",
@@ -72,10 +72,13 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
     ws.title = "包络汇总"
     ws.append([f"{cfg.name} 关节结构载荷包络 ({len(keys)} 工况取最大)"])
     ws["A1"].font = Font(bold=True, size=12)
-    ws.append([])
+    ws.append(["参考判据: 落地冲击转矩实测约 2.3×额定属正常; 电机峰值能力 5~10×额定, 持续 3~10 s; "
+               "选型建议预留 3×转矩余量 (机器狗设计工况统计)"])
+    ws["A2"].font = Font(color="808080", size=9)
     hdr = ["关节", "腿", "部位"]
     for m in METRICS:
         hdr += [METRIC_CN[m], "来源工况"]
+    hdr += ["驱动额定(N·m)", "|驱动|包络/额定"]
     ws.append(hdr)
     for c in ws[3]:
         c.fill, c.font, c.alignment = hdr_fill, hdr_font, thin
@@ -83,8 +86,9 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
         row = [jn.replace("_joint", ""), LEG_CN[lg], PART_CN[p]]
         for m in METRICS:
             row += [round(float(env[m][i]), 1), src[m][i]]
+        row += [rated, f"{env['drive'][i] / rated * 100:.0f}%"]
         ws.append(row)
-    for j, w in enumerate([16, 6, 12] + [13, 9] * len(METRICS), 1):
+    for j, w in enumerate([16, 6, 18] + [13, 9] * len(METRICS) + [14, 15], 1):
         ws.column_dimensions[get_column_letter(j)].width = w
     ws.freeze_panes = "A4"
 
@@ -127,7 +131,7 @@ def build_envelope(cfg: RobotConfig, case_wrench_csvs, case_names, case_descs, o
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    jn_short = [mm[0].replace("_joint", "") for mm in meta]
+    jn_short = [f"{mm[0].replace('_joint', '')}({PART_NO[mm[2]]})" for mm in meta]
 
     def heatmap(ax, M, title, cmap):
         im = ax.imshow(M, aspect="auto", cmap=cmap)
