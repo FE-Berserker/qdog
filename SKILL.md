@@ -38,11 +38,52 @@ description: 用 MuJoCo 对四足机器狗做动作仿真与关节载荷分析 �
 
 ## 首次使用检查
 
+0. `python scripts/selfupdate.py` —— **自更新** (任何平台、任何客户端都应先跑这一步;
+   见下节)。节流默认 24 h, 因此重复调用几乎无开销
 1. `pip install -r requirements.txt` (mujoco / numpy / matplotlib / openpyxl / pillow)
 2. 准备机器人模型: A2 需 `unitree_robots/a2/a2.xml` (本仓库不含, 从 Unitree 官方获取)
 3. `python verify_sensor.py` → 期望输出 `PASS` (弯矩测量方法的双摆数值验证)
 4. `python run_pipeline.py --list` → 确认机型与动作注册
 5. 之后按上面的铁律逐动作驱动
+
+## 自更新 (平台无关)
+
+更新逻辑**自带在技能内部** (`scripts/selfupdate.py`), 不依赖任何客户端的更新机制 ——
+读 `SKILL.md` 的 agent (ZCode / Claude Code / 其它) 或人类都能调它, OS 层的定时任务
+也调同一个脚本。
+
+| 命令 | 用途 |
+| --- | --- |
+| `python scripts/selfupdate.py` | 节流自更新 (会话开始时调; 距上次不足 24 h 直接返回, 不联网) |
+| `python scripts/selfupdate.py --check` | 只看有没有更新, 不拉取、不写状态 (无副作用) |
+| `python scripts/selfupdate.py --force` | 忽略节流立即检查 |
+| `python scripts/selfupdate.py --quiet` | 无输出 (供定时任务调用) |
+
+环境变量: `QDOG_UPDATE_INTERVAL` 节流秒数 (默认 86400, 设 0 关闭)、`QDOG_UPDATE_OFF=1` 完全禁用。
+
+**安全护栏** (自更新绝不能打断任务): 只快进 (`pull --ff-only`); 工作区有未提交改动时
+只报告不拉取 (保护本地调参); 网络不可达 / 非 git 仓库时保持本地版本并**退出码仍为 0**;
+瞬时失败 1 h 后重试, 而不是等满一个间隔。
+
+**两条纪律**:
+
+- *只在开新任务前更新, 不在跑动作途中更新* —— 代码中途变会让 `results/` 里不同工况的
+  数据来自不同版本的代码, 事后无法分辨;
+- 若更新报告里有 `.py` 变更, 之前 `results/` 的结果**不再与当前代码严格对应**,
+  引用旧数据下结论前先重跑相关动作。
+
+想让它在你不开 agent 时也自动更新, 挂一个 OS 级定时任务调同一个脚本即可:
+
+```cmd
+:: Windows: 每天 09:00 静默自更新
+schtasks /create /tn "qdog self-update" /sc daily /st 09:00 ^
+  /tr "python \"<技能目录>\scripts\selfupdate.py\" --quiet"
+```
+
+```bash
+# Linux/macOS: 每小时
+crontab -e   # 0 * * * * python3 <技能目录>/scripts/selfupdate.py --quiet
+```
 
 ## 已注册动作 (A2)
 
@@ -80,6 +121,7 @@ description: 用 MuJoCo 对四足机器狗做动作仿真与关节载荷分析 �
 | `quad_pipeline/envelope.py` | 跨工况载荷包络 |
 | `quad_pipeline/video.py` | 双机位跟踪视频 (含坡度/负载可视化; 支持 `t_win` 只渲染时间窗) |
 | `check_motion.py` | 动作自检: 步态占空比/周期、左右对称性、触地相足端漂移(打滑)、摆动相接触(拖地)、腾空占比、航向漂移、峰值裕度 |
+| `scripts/selfupdate.py` | 技能自更新 (平台无关): 节流、只快进、保护本地未提交改动、失败不打断调用方 |
 | `verify_sensor.py` | 弯矩测量方法的数值验证 |
 
 ## 输出
