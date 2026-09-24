@@ -262,58 +262,24 @@ class JumpMotion(CaseSimBase):
             self.phase = "hold"
 
 
-# ============================================================ 前扑跳跃 v5
-@motion("leap", "前扑跳跃",
-        "1.3 m/s trot 助跑 -> 后腿双支撑相位触发 -> 反向下沉蓄力 -> 四腿伸展弹射(足端钉地) -> "
-        "腾空前扑 -> 前腿先着地缓冲",
-        t_end=6.0, win=(2.2, 4.5))
+# ============================================================ 前扑跳跃 v2
+@motion("leap", "前扑跳跃", "1.0 m/s起跑->深蹲偏置爆发蹬伸->腾空前扑->前腿先着地缓冲",
+        t_end=5.0, win=(1.6, 4.0))
 class LeapMotion(CaseSimBase):
-    """前扑跳跃控制器 v5 (跑动中弹射, 无深蹲段)。
-
-    v2 及其各改版都失败在同一个机理上, 本版逐条绕开:
-
-    1) v2 靠"深蹲(腿长 0.44→0.26)+爆发伸展"提供垂直冲量。助跑一快, 深蹲段
-       0.25~0.45 s 里身体前进量超过腿的工作空间 (髋-足水平距离被推到 −0.30 m
-       以外, 需要腿长 >0.52 m) → 后腿被拉离地面 → 只剩前腿蹬 → 低头栽倒。
-       本版取消深蹲: 助跑改为"低位站姿"(腿长 0.36 m 而非 0.44 m) 预先压缩,
-       弹射段只是把这个预压缩量放开 (0.36→0.50 m), 身体前进量仅 ~0.19 m。
-    2) 收腿/蹬伸段无姿态反馈 → 低头力矩发散。本版前腿只伸到 0.45 m (后腿
-       0.50 m), 并把俯仰/横滚配平全部交给前腿 —— 后腿专职推进, 前腿专职姿态。
-    3) 触发时机随机 (固定时刻) 会撞上后腿摆动相, 单靠前腿支撑 → 侧翻/前扑。
-       本版把触发同步到 trot 相位: 两条后腿同时在支撑相的窗口 (占空比 0.55
-       的对角步态, 每周期约 5% 时间) 才触发弹射。
-    4) v2 从 t=0 就施加满额 V_RUN, 启动瞬态扫腿幅值过大。本版速度按 smoothstep
-       爬坡 (与 WalkMotion 一致), 站姿也随速度指令平滑压低。
-    """
-
     Z_LO = 0.18
     ATT_LIM = 1.0
 
     GAIT_T, DUTY, STEP_H, K_FB = 0.45, 0.55, 0.08, 0.15
     K_PITCH, K_PITCHD = 0.10, 0.03
     K_ROLL, K_ROLLD = 0.10, 0.03
-
-    V_RUN, T_SETTLE, T_RAMP = 1.3, 0.8, 1.2
-    R_ST = 0.40                      # 助跑站姿
-    T_RUN_MIN, T_RUN_MAX = 2.3, 3.2  # 弹射触发的时间下限/上限
-    PHI_WIN = 0.06                   # 后腿双支撑相位窗口宽度
-
-    # 反向下沉 (countermovement) + 弹射: 下沉加长腿部做功行程,
-    # 执行器扭矩受限 (小腿 180 N·m 全程饱和), 行程越长总冲量越大
-    T_DIP, T_PUSH_D = 0.07, 0.18
-    R_DIP = 0.26                     # 下沉末端腿长
-    R_PUSH_H, R_PUSH_F = 0.50, 0.50  # 弹射末端腿长 (四腿同步蹬满)
-    X_LIM = 0.24                     # 足端后扫限幅 (腿工作空间)
-    K_BAL, K_BALD = 0.9, 0.05        # 弹射段姿态配平
-
-    R_AIR_FORE, X_AIR_FORE = 0.44, 0.16
-    R_AIR_HIND = 0.34
-    # 空中滚转控制: 四腿髋外展同向摆动 → 机身反向滚转 (角动量交换)
-    # (腾空段原本无任何滚转控制, 起飞带上 ~78°/s 滚转角速度会积分到 24°)
-    K_AIR_ROLL, K_AIR_ROLLD = 1.0, 0.14
-    HIP_AIR_LIM = 0.30
+    T_SETTLE, T_RUN, T_CROUCH, T_PUSH = 0.8, 1.6, 1.85, 2.05
+    R_CROUCH = 0.26
+    R_PUSH_HIND, R_PUSH_FORE = 0.50, 0.46
+    R_AIR_FORE, X_AIR_FORE = 0.44, 0.12
+    R_AIR_HIND = 0.32
     R_ABSORB = 0.33
     T_ABSORB, T_RECOVER = 0.45, 0.7
+    V_RUN = 1.0
 
     def __init__(self, cfg, model=None, scene=None):
         super().__init__(cfg, model=model, scene=scene)
@@ -322,16 +288,10 @@ class LeapMotion(CaseSimBase):
         self.phase = "run"
         self.events = {}
         self._air_count = 0
-        self._x_pin0 = {lg: 0.0 for lg in cfg.legs}
-        self._x_ref = None
-        self._t_push = None
-        self.hip_bid = {lg: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY,
-                                              cfg.body_fmt.format(leg=lg, part="hip"))
-                        for lg in cfg.legs}
 
     def init_pose(self):
         q0 = np.zeros(self.model.nq)
-        self.stand_pose(q0, r=self.R_ST)
+        self.stand_pose(q0)
         self.data.qpos[:] = q0
         mujoco.mj_forward(self.model, self.data)
 
@@ -342,22 +302,6 @@ class LeapMotion(CaseSimBase):
             self._air_count = 0
         return self._air_count >= 3
 
-    def _foot_hip_x(self, lg):
-        """足端相对髋的位置在躯干系下的 x 分量 (钉地起始点, 用真实 FK)。"""
-        d = self.data
-        gid = self.foot_geoms[lg][0]
-        R = d.xmat[self.trunk_bid].reshape(3, 3)
-        return float(R[:, 0] @ (d.geom_xpos[gid] - d.xpos[self.hip_bid[lg]]))
-
-    def v_cmd(self):
-        u = (self.t - self.T_SETTLE) / self.T_RAMP
-        return self.V_RUN * smoothstep(u) if u > 0.0 else 0.0
-
-    def stance_r(self):
-        """站姿腿长随速度指令平滑压低到 R_ST (预压缩)。"""
-        u = (self.t - self.T_SETTLE) / self.T_RAMP
-        return self.cfg.r_stand + (self.R_ST - self.cfg.r_stand) * smoothstep(u)
-
     def step(self):
         d = self.data
         v_x = d.qvel[0]
@@ -365,22 +309,11 @@ class LeapMotion(CaseSimBase):
         roll_r, pitch_r = d.qvel[3], d.qvel[4]
         fz_sum = sum(self.foot_forces().values())
 
-        if self.phase == "run":
-            phi = ((self.t - self.T_SETTLE) / self.GAIT_T) % 1.0
-            # 两条后腿同时在支撑相: RL 相位 0.5, RR 相位 0.0 → φ_clock 落在窗口内
-            hind_st = all(((phi + self.PHASE0[lg]) % 1.0) < self.DUTY
-                          for lg in self.cfg.legs if lg.startswith("R"))
-            if (self.t >= self.T_RUN_MIN and hind_st and phi < self.PHI_WIN) \
-                    or self.t >= self.T_RUN_MAX:
-                self.phase = "dip"
-                self._x_ref = float(d.qpos[0])
-                self._x_pin0 = {lg: self._foot_hip_x(lg) for lg in self.cfg.legs}
-                self._t_dip = self.t
-                self._r0 = self.stance_r()
-        elif self.phase == "dip" and self.t >= self._t_dip + self.T_DIP:
+        if self.phase == "run" and self.t >= self.T_RUN:
+            self.phase = "crouch"
+        elif self.phase == "crouch" and self.t >= self.T_CROUCH:
             self.phase = "push"
-            self._t_push = self.t
-        elif self.phase == "push" and self.t >= self._t_push + self.T_PUSH_D and self._grounded3(fz_sum):
+        elif self.phase == "push" and self.t >= self.T_PUSH and self._grounded3(fz_sum):
             self.phase = "air"
             self.events["t_takeoff"] = self.t
             self.events["vx_takeoff"] = v_x
@@ -392,21 +325,19 @@ class LeapMotion(CaseSimBase):
             self.phase = "recover"
             self.events["t_recover"] = self.t
 
-        self.vcmd_now = self.v_cmd() if self.phase == "run" else 0.0
+        self.vcmd_now = self.V_RUN if self.phase == "run" else 0.0
         q_tgt = np.zeros(12)
         kp = np.zeros(12)
         kd = np.zeros(12)
         kd_scale = 1.0
 
         if self.phase == "run":
-            vcmd = self.vcmd_now
-            r_st = self.stance_r()
             T_st = self.DUTY * self.GAIT_T
-            x_a = float(np.clip(0.5 * max(vcmd, 0.05) * T_st, 0.02, 0.26))
-            x_c = float(np.clip(self.K_FB * (v_x - vcmd), -0.12, 0.12))
+            x_a = float(np.clip(0.5 * max(self.vcmd_now, 0.05) * T_st, 0.02, 0.26))
+            x_c = float(np.clip(self.K_FB * (v_x - self.vcmd_now), -0.12, 0.12))
             for li, lg in enumerate(self.cfg.legs):
                 x_f, z_f, st = self.foot_target(lg, x_a, x_c, self.GAIT_T, self.DUTY,
-                                                self.STEP_H, r_st,
+                                                self.STEP_H, self.cfg.r_stand,
                                                 self.PHASE0, self.T_SETTLE)
                 depth = -z_f
                 if st:
@@ -420,20 +351,18 @@ class LeapMotion(CaseSimBase):
                 kp[li * 3:li * 3 + 3] = self.kp_st[li * 3:li * 3 + 3] if st else self.kp_sw[li * 3:li * 3 + 3]
                 kd[li * 3:li * 3 + 3] = self.kd_st[li * 3:li * 3 + 3] if st else self.kd_sw[li * 3:li * 3 + 3]
         else:
-            dx_body = float(d.qpos[0] - self._x_ref) if self._x_ref is not None else 0.0
-            e_bal = float(np.clip(self.K_BAL * pitch + self.K_BALD * pitch_r, -0.06, 0.06))
-            e_roll = float(np.clip(self.K_BAL * roll + self.K_BALD * roll_r, -0.06, 0.06))
             for li, lg in enumerate(self.cfg.legs):
                 is_front = lg.startswith("F")
-                x_t = float(np.clip(self._x_pin0[lg] - dx_body, -self.X_LIM, 0.26))
-                bal = (e_bal if is_front else -e_bal) + (-e_roll if lg[1] == "L" else e_roll)
-                if self.phase == "dip":
-                    u = smoothstep((self.t - self._t_dip) / self.T_DIP)
-                    r_t = self._r0 + (self.R_DIP - self._r0) * u + bal
+                if self.phase == "crouch":
+                    # 足端随身体前进而后扫, 避免摩擦刹车
+                    u = smoothstep((self.t - self.T_RUN) / (self.T_CROUCH - self.T_RUN))
+                    x_t = 0.06 - 0.12 * u
+                    r_t = self.cfg.r_stand + (self.R_CROUCH - self.cfg.r_stand) * u
                 elif self.phase == "push":
-                    u = smoothstep((self.t - self._t_push) / self.T_PUSH_D)
-                    r_tgt = self.R_PUSH_F if is_front else self.R_PUSH_H
-                    r_t = self.R_DIP + (r_tgt - self.R_DIP) * u + bal
+                    u = smoothstep((self.t - self.T_CROUCH) / (self.T_PUSH - self.T_CROUCH))
+                    r_tgt = self.R_PUSH_HIND if not is_front else self.R_PUSH_FORE
+                    x_t = -0.06 - 0.08 * u
+                    r_t = self.R_CROUCH + (r_tgt - self.R_CROUCH) * u
                 elif self.phase == "air":
                     if is_front:
                         x_t, r_t = self.X_AIR_FORE, self.R_AIR_FORE
@@ -441,10 +370,6 @@ class LeapMotion(CaseSimBase):
                         x_t, r_t = -0.05, self.R_AIR_HIND
                     kp[li * 3:li * 3 + 3] = self.kp_sw[li * 3:li * 3 + 3]
                     kd[li * 3:li * 3 + 3] = self.kd_sw[li * 3:li * 3 + 3]
-                    # 四腿同向摆动产生反向滚转力矩
-                    q_tgt[li * 3] = float(np.clip(
-                        self.K_AIR_ROLL * roll + self.K_AIR_ROLLD * roll_r,
-                        -self.HIP_AIR_LIM, self.HIP_AIR_LIM))
                 elif self.phase == "absorb":
                     x_t, r_t = 0.0, self.R_ABSORB
                     kd_scale = 2.5
@@ -452,7 +377,7 @@ class LeapMotion(CaseSimBase):
                     u = smoothstep((self.t - self.events["t_recover"]) / self.T_RECOVER)
                     x_t, r_t = 0.0, self.R_ABSORB + (self.cfg.r_stand - self.R_ABSORB) * u
 
-                if self.phase in ("dip", "push", "absorb", "recover"):
+                if self.phase in ("crouch", "push", "absorb", "recover"):
                     kp[li * 3:li * 3 + 3] = self.kp_st[li * 3:li * 3 + 3]
                     kd[li * 3:li * 3 + 3] = self.kd_st[li * 3:li * 3 + 3] * kd_scale
 
@@ -462,6 +387,7 @@ class LeapMotion(CaseSimBase):
                 q_tgt[li * 3 + 2] = th2
 
         self.apply_pd(q_tgt, kp, kd)
+        # 支撑标志供视频/统计: 冲击阶段用接触力
         if self.phase != "run":
             self.mark_stance_by_contact(self.foot_forces())
 
