@@ -16,7 +16,10 @@ from .core import C_FZ, C_ST, C_BX, C_BY, C_BZ, C_VX, C_VCMD
 from .config import RobotConfig
 
 PANEL_W, PANEL_H = 720, 528
-STRIP_H = 80
+# 信息条高度: 需容纳 表头(17) + 数值(17) + 最高柱(38) + 足端标签(17) + 间隙。
+# 原为 80: 标签画在 base_y+3 = 597, 17px 字号下需到 614, 而画布仅 608 高 ——
+# 12 个工况所有帧的 FL/RL/FR/RR 标签都被下边缘切掉约 1/3 (视觉验收发现)。
+STRIP_H = 110
 CANVAS_W, CANVAS_H = PANEL_W * 2, PANEL_H + STRIP_H
 
 
@@ -147,7 +150,8 @@ def render_video(cfg: RobotConfig, trace_path, scene_path, label, out_avi,
         d.text((360, y0 + 38), f"总地面反力 {fz.sum():6.0f} N  ({fz.sum()/(cfg.mass * 9.81):.1f}×体重)",
                font=f_mid, fill=(200, 210, 220))
         bx0, bw, bgap, bmax = 1000, 92, 14, 600.0
-        base_y = y0 + STRIP_H - 14
+        # 柱底基线留出 24px 给足端标签 (17px 字号), 标签不会再被画布下边缘切掉
+        base_y = y0 + STRIP_H - 24
         d.text((bx0 - 6, y0 + 6), "四足垂直反力 (N)", font=f_small, fill=(160, 170, 180))
         for j, lg in enumerate(cfg.legs):
             x = bx0 + j * (bw + bgap)
